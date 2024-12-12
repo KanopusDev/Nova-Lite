@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="flex flex-col min-h-screen">
+    <!-- Header -->
+    <header class="p-4">
+        <nav class="flex justify-between items-center max-w-7xl mx-auto">
+            <a href="/" class="text-2xl font-bold text-blue-500">Nova Lite</a>
+            <div class="flex items-center gap-4">
+                <button class="px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700">Sign In</button>
+            </div>
+        </nav>
+    </header>
+
+    <!-- Main Content -->
+    <main class="flex-1 flex items-center justify-center px-4">
+        <div class="w-full max-w-3xl text-center">
+            <h1 class="text-4xl md:text-5xl font-bold mb-8">
+                Enhance your <span class="text-blue-500">search</span> with AI
+            </h1>
+            <form action="{{ url_for('search') }}" method="get" class="space-y-4">
+                <div class="relative">
+                    <input type="text" name="q" 
+                           class="w-full px-6 py-4 bg-gray-800 border border-gray-700 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 text-lg"
+                           placeholder="Ask anything...">
+                    <div class="absolute right-4 top-1/2 -translate-y-1/2 flex gap-2">
+                        <select name="type" class="bg-gray-700 text-white rounded-lg px-3 py-2">
+                            <option value="">All Types</option>
+                            <option value="pdf">PDF</option>
+                            <option value="doc">Document</option>
+                            <option value="code">Code</option>
+                            <option value="data">Data</option>
+                        </select>
+                        <button type="submit" class="bg-blue-600 text-white rounded-lg px-6 py-2 hover:bg-blue-700">
+                            Search
+                        </button>
+                    </div>
+                </div>
+            </form>
+            <div class="mt-8 text-gray-400">
+                Smart search with AI-powered file type detection and summarization
+            </div>
+        </div>
+    </main>
+</div>
+{% endblock %}
