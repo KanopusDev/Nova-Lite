@@ -1,0 +1,55 @@
+{% extends "base.html" %}
+
+{% block content %}
+<div class="min-h-screen p-4">
+    <header class="mb-8">
+        <div class="max-w-4xl mx-auto flex items-center justify-between">
+            <a href="/" class="text-2xl font-bold text-blue-500">Nova Lite</a>
+            <a href="/" class="text-sm text-gray-500 hover:text-gray-700 dark:hover:text-gray-300">
+                Back to Search
+            </a>
+        </div>
+    </header>
+
+    <main class="max-w-4xl mx-auto">
+        <div class="bg-light-input dark:bg-dark-input rounded-xl p-8">
+            <h1 class="text-2xl font-bold mb-6">Settings</h1>
+            
+            <form action="{{ url_for('save_settings') }}" method="post" class="space-y-6">
+                <div class="space-y-4">
+                    <div>
+                        <label class="block text-sm font-medium mb-2">Google API Key</label>
+                        <input type="password" name="api_key" value="{{ api_key }}"
+                               class="w-full px-4 py-2 bg-light-bg dark:bg-dark-bg border border-light-border dark:border-dark-border rounded-lg">
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium mb-2">Search Engine ID</label>
+                        <input type="password" name="search_engine_id" value="{{ search_engine_id }}"
+                               class="w-full px-4 py-2 bg-light-bg dark:bg-dark-bg border border-light-border dark:border-dark-border rounded-lg">
+                    </div>
+                </div>
+
+                <div class="pt-4">
+                    <button type="submit" 
+                            class="w-full px-4 py-2 bg-blue-600 text-white rounded-lg hover:bg-blue-700">
+                        Save Settings
+                    </button>
+                </div>
+            </form>
+
+            <div class="mt-8 text-sm text-gray-500 dark:text-gray-400">
+                <h2 class="font-medium mb-2">How to get your API keys:</h2>
+                <ol class="list-decimal list-inside space-y-2">
+                    <li>Go to <a href="https://console.cloud.google.com" target="_blank" class="text-blue-500 hover:underline">Google Cloud Console</a></li>
+                    <li>Create a new project or select existing one</li>
+                    <li>Enable Custom Search API</li>
+                    <li>Create credentials (API key)</li>
+                    <li>Go to <a href="https://programmablesearchengine.google.com" target="_blank" class="text-blue-500 hover:underline">Programmable Search Engine</a></li>
+                    <li>Create a new search engine</li>
+                    <li>Copy the Search Engine ID</li>
+                </ol>
+            </div>
+        </div>
+    </main>
+</div>
+{% endblock %}

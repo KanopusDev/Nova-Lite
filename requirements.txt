@@ -11,3 +11,4 @@ tldextract>=3.1.0
 dnspython>=2.1.0
 reverse_geocoder>=1.5.1
 diskcache>=5.4.0
+markdown2>=2.4.0

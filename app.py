@@ -1,6 +1,6 @@
-from flask import Flask, render_template, request, jsonify, session
+from flask import Flask, render_template, request, jsonify, session, redirect, url_for
 from googleapiclient.discovery import build
-from transformers import pipeline, AutoModelForSeq2SeqGeneration, AutoTokenizer
+from transformers import pipeline, AutoTokenizer  # Simplified imports
 import os
 import re
 from dotenv import load_dotenv
@@ -20,12 +20,41 @@ import functools
 import hashlib
 import pickle
 from pathlib import Path
+import json
+import markdown2
+from textwrap import dedent
 warnings.filterwarnings('ignore')
 
 load_dotenv()
 
 app = Flask(__name__)
 app.secret_key = os.urandom(24)
+
+# Load settings from file
+def load_settings():
+    try:
+        settings_file = Path(__file__).parent / 'settings.json'
+        if settings_file.exists():
+            with open(settings_file, 'r') as f:
+                return json.load(f)
+    except Exception as e:
+        print(f"Error loading settings: {e}")
+    return {'api_key': '', 'search_engine_id': ''}
+
+def save_settings_to_file(settings):
+    try:
+        settings_file = Path(__file__).parent / 'settings.json'
+        with open(settings_file, 'w') as f:
+            json.dump(settings, f)
+        return True
+    except Exception as e:
+        print(f"Error saving settings: {e}")
+        return False
+
+# Update API key initialization
+settings = load_settings()
+GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY') or settings.get('api_key')
+SEARCH_ENGINE_ID = os.getenv('SEARCH_ENGINE_ID') or settings.get('search_engine_id')
 
 # Initialize Google Custom Search API
 GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY')
@@ -49,45 +78,60 @@ SEARCH_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 # Performance optimizations
 torch.set_grad_enabled(False)  # Disable gradients
 torch.set_num_threads(4)  # Limit CPU threads
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
 
-# Initialize AI Model with caching
-def init_ai_model():
+# Global model state
+MODEL_STATE = {
+    'initialized': False,
+    'summarizer': None,
+    'error': None
+}
+
+def initialize_models():
+    """Pre-initialize all models before first request"""
+    global MODEL_STATE
     try:
+        print("Initializing AI models...")
         model_path = MODEL_CACHE_DIR / "bart-large-cnn"
+        
         if not model_path.exists():
-            print("Downloading and caching model...")
-            tokenizer = AutoTokenizer.from_pretrained(
-                "facebook/bart-large-cnn",
-                cache_dir=model_path
-            )
-            model = AutoModelForSeq2SeqGeneration.from_pretrained(
-                "facebook/bart-large-cnn",
+            print("Downloading models (this may take a few minutes)...")
+            summarizer = pipeline(
+                "summarization",
+                model="facebook/bart-large-cnn",
+                device=-1,
                 cache_dir=model_path,
-                low_cpu_mem_usage=True,
-                torch_dtype=torch.float32
+                model_kwargs={"low_cpu_mem_usage": True}
             )
         else:
-            print("Loading model from cache...")
-            tokenizer = AutoTokenizer.from_pretrained(model_path)
-            model = AutoModelForSeq2SeqGeneration.from_pretrained(
-                model_path,
-                low_cpu_mem_usage=True,
-                torch_dtype=torch.float32
+            print("Loading cached models...")
+            summarizer = pipeline(
+                "summarization",
+                model=str(model_path),
+                device=-1,
+                model_kwargs={"low_cpu_mem_usage": True}
             )
         
-        return pipeline(
-            "summarization",
-            model=model,
-            tokenizer=tokenizer,
-            framework="pt",
-            device=-1,  # Force CPU
-            batch_size=1
-        )
+        MODEL_STATE['summarizer'] = summarizer
+        MODEL_STATE['initialized'] = True
+        print("Models initialized successfully!")
+        
     except Exception as e:
-        print(f"AI model initialization error: {e}")
-        return None
+        MODEL_STATE['error'] = str(e)
+        print(f"Model initialization error: {e}")
 
-summarizer = init_ai_model()
+# Initialize models before first request
+@app.before_first_request
+def setup():
+    initialize_models()
+
+def get_model_status():
+    """Get current model initialization status"""
+    return {
+        'initialized': MODEL_STATE['initialized'],
+        'error': MODEL_STATE['error']
+    }
 
 # Add search result caching
 def cache_key(query, **kwargs):
@@ -222,7 +266,7 @@ def resolve_regional_url(url, region=None):
         return url
 
 @cache_results
-def google_search(query, num=20, file_type=None, section=None):
+def google_search(query, num=20, file_type=None, section=None, region=None):
     try:
         service = build("customsearch", "v1", developerKey=GOOGLE_API_KEY)
         
@@ -241,11 +285,10 @@ def google_search(query, num=20, file_type=None, section=None):
         }
         
         # Add location if available
-        if 'user_location' in session:
-            location = session['user_location']
+        if region:
             search_params.update({
-                'gl': location['country'].upper(),  # Geographic location
-                'cr': f"country{location['country'].upper()}"  # Country restrict
+                'gl': region.upper(),  # Geographic location
+                'cr': f"country{region.upper()}"  # Country restrict
             })
         
         # Add section-specific parameters
@@ -277,12 +320,11 @@ def google_search(query, num=20, file_type=None, section=None):
             
         else:
             items = result.get('items', [])
-        
-            # Process results with regional awareness
             enhanced_results = []
+            
             for item in items:
                 try:
-                    # Resolve regional URL
+                    # Resolve regional URL with the passed region parameter
                     regional_url = resolve_regional_url(item.get('link', ''), region)
                     
                     enhanced_results.append({
@@ -308,27 +350,32 @@ def google_search(query, num=20, file_type=None, section=None):
 def process_with_ai(query, search_results):
     if not search_results:
         return None
+    
+    # Check model status
+    if not MODEL_STATE['initialized']:
+        return "AI models are still initializing. Please try again in a moment."
+    
+    if MODEL_STATE['error']:
+        return f"AI analysis unavailable: {MODEL_STATE['error']}"
         
     try:
-        # Create a simpler context for the AI
-        snippets = [r['snippet'] for r in search_results[:3] if r.get('snippet')]  # Reduced from 5 to 3
+        snippets = [r['snippet'] for r in search_results[:3] if r.get('snippet')]
         if not snippets:
             return None
             
         context = f"Search: {query}\n\n" + "\n".join(snippets)
         
-        # Generate summary with error handling and chunking
         try:
             chunks = [context[i:i+512] for i in range(0, len(context), 512)]
             summaries = []
             
             for chunk in chunks:
-                result = summarizer(
+                result = MODEL_STATE['summarizer'](
                     chunk,
                     max_length=130,
                     min_length=30,
                     do_sample=False,
-                    num_beams=1  # Reduced from 2
+                    num_beams=1
                 )
                 if result:
                     summaries.append(result[0]['summary_text'])
@@ -337,19 +384,37 @@ def process_with_ai(query, search_results):
                 return None
                 
             summary = " ".join(summaries)
+            
+            # Format summary as markdown
+            markdown_summary = dedent(f"""
+                ## Search Summary
+
+                {summary}
+
+                ### Key Information
+                
+                * **Query**: {query}
+                * **Results**: {len(search_results)} found
+                * **Types**: {', '.join(set(r['file_type'] for r in search_results))}
+
+                ### Search Tips
+                
+                * Use `"quotes"` for exact matches
+                * Try `-exclude` to remove terms
+                * Use `site:example.com` to search specific sites
+                * Filter by file type using the dropdown
+            """)
+            
+            # Convert markdown to HTML
+            return markdown2.markdown(
+                markdown_summary,
+                extras=['fenced-code-blocks', 'tables', 'break-on-newline']
+            )
                 
         except Exception as e:
             print(f"Summarization error: {e}")
             return None
         
-        return f"""📌 Key Points:
-{summary}
-
-💡 Search Tips:
-• Add quotes for exact phrases
-• Try different keywords
-• Use filters for better results"""
-
     except Exception as e:
         print(f"AI processing error: {e}")
         return None
@@ -389,7 +454,15 @@ def search():
         return render_template('index.html')
     
     try:
-        results = google_search(query, file_type=file_type, section=section)
+        # Get user's region before search
+        region = None
+        if 'user_location' in session:
+            region = session['user_location'].get('country')
+        if not region:
+            region = get_user_region(request)
+        
+        # Pass region to search function
+        results = google_search(query, file_type=file_type, section=section, region=region)
         
         if not results:
             return render_template('results.html',
@@ -411,9 +484,6 @@ def search():
                                 shopping_results=results)
         
         else:
-            # Get search results
-            results = google_search(query, file_type=file_type)
-            
             # Process with AI only for informational queries
             ai_response = None
             if len(query.split()) > 2:  # Only process complex queries
@@ -439,6 +509,37 @@ def search():
                              error=f"Search error: {str(e)}",
                              section=section,
                              grouped_results={})
+
+@app.route('/settings')
+def settings_page():
+    settings = load_settings()
+    return render_template('settings.html',
+                         api_key=settings.get('api_key', ''),
+                         search_engine_id=settings.get('search_engine_id', ''))
+
+@app.route('/settings/save', methods=['POST'])
+def save_settings():
+    global GOOGLE_API_KEY, SEARCH_ENGINE_ID
+    
+    api_key = request.form.get('api_key')
+    search_engine_id = request.form.get('search_engine_id')
+    
+    if api_key and search_engine_id:
+        settings = {
+            'api_key': api_key,
+            'search_engine_id': search_engine_id
+        }
+        if save_settings_to_file(settings):
+            GOOGLE_API_KEY = api_key
+            SEARCH_ENGINE_ID = search_engine_id
+            return redirect(url_for('home'))
+    
+    return redirect(url_for('settings_page'))
+
+@app.route('/api/model-status')
+def model_status():
+    """API endpoint to check model status"""
+    return jsonify(get_model_status())
 
 if __name__ == '__main__':
     app.run(debug=True)
