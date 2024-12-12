@@ -8,6 +8,8 @@
     <meta property="og:title" content="Nova Lite | AI-Powered Search">
     <meta property="og:type" content="website">
     <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/toastify-js"></script>
+    <link rel="stylesheet" href="https://unpkg.com/toastify-js/src/toastify.css">
     <script>
         tailwind.config = {
             darkMode: 'class',
@@ -22,6 +24,53 @@
                 }
             }
         }
+
+        // Notification system
+        function showNotification(message, type = 'info') {
+            const bgColors = {
+                'error': '#ef4444',
+                'success': '#22c55e',
+                'info': '#3b82f6',
+                'warning': '#f59e0b'
+            };
+            
+            Toastify({
+                text: message,
+                duration: 3000,
+                gravity: "top",
+                position: "right",
+                style: { background: bgColors[type] }
+            }).showToast();
+        }
+
+        // Location handler
+        async function getLocation() {
+            try {
+                const position = await new Promise((resolve, reject) => {
+                    navigator.geolocation.getCurrentPosition(resolve, reject);
+                });
+                
+                const response = await fetch('/update_location', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        lat: position.coords.latitude,
+                        lon: position.coords.longitude
+                    })
+                });
+                
+                if (response.ok) {
+                    showNotification('Location updated successfully', 'success');
+                }
+            } catch (error) {
+                showNotification('Please enable location for better results', 'warning');
+            }
+        }
+
+        // Initialize
+        document.addEventListener('DOMContentLoaded', () => {
+            getLocation();
+        });
     </script>
 </head>
 <body class="bg-dark-bg text-dark-text">

@@ -1,6 +1,6 @@
-from flask import Flask, render_template, request, jsonify
+from flask import Flask, render_template, request, jsonify, session
 from googleapiclient.discovery import build
-from transformers import pipeline, AutoModelForCausalLM, AutoTokenizer
+from transformers import pipeline, AutoModelForSeq2SeqGeneration, AutoTokenizer
 import os
 import re
 from dotenv import load_dotenv
@@ -12,11 +12,20 @@ import torch
 import socket
 import geoip2.database
 import warnings
+import tldextract
+import dns.resolver
+import concurrent.futures
+import reverse_geocoder as rg
+import functools
+import hashlib
+import pickle
+from pathlib import Path
 warnings.filterwarnings('ignore')
 
 load_dotenv()
 
 app = Flask(__name__)
+app.secret_key = os.urandom(24)
 
 # Initialize Google Custom Search API
 GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY')
@@ -28,28 +37,82 @@ try:
 except:
     GEOIP_READER = None
 
-# Initialize AI Model
-try:
-    # Try loading local model first
-    model_name = "TheBloke/Llama-2-7B-Chat-GGML"
-    summarizer = pipeline(
-        "summarization",
-        model="facebook/bart-large-cnn",
-        device=0 if torch.cuda.is_available() else -1
-    )
-except Exception as e:
-    print(f"Warning: Could not load primary model: {e}")
-    # Fallback to smaller model
+# Constants
+CACHE_DIR = Path(__file__).parent / "cache"
+MODEL_CACHE_DIR = CACHE_DIR / "models"
+SEARCH_CACHE_DIR = CACHE_DIR / "search"
+
+# Create cache directories
+MODEL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+SEARCH_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+# Performance optimizations
+torch.set_grad_enabled(False)  # Disable gradients
+torch.set_num_threads(4)  # Limit CPU threads
+
+# Initialize AI Model with caching
+def init_ai_model():
     try:
-        model_name = "distilgpt2"
-        summarizer = pipeline(
-            "text-generation",
-            model=model_name,
-            device=0 if torch.cuda.is_available() else -1
+        model_path = MODEL_CACHE_DIR / "bart-large-cnn"
+        if not model_path.exists():
+            print("Downloading and caching model...")
+            tokenizer = AutoTokenizer.from_pretrained(
+                "facebook/bart-large-cnn",
+                cache_dir=model_path
+            )
+            model = AutoModelForSeq2SeqGeneration.from_pretrained(
+                "facebook/bart-large-cnn",
+                cache_dir=model_path,
+                low_cpu_mem_usage=True,
+                torch_dtype=torch.float32
+            )
+        else:
+            print("Loading model from cache...")
+            tokenizer = AutoTokenizer.from_pretrained(model_path)
+            model = AutoModelForSeq2SeqGeneration.from_pretrained(
+                model_path,
+                low_cpu_mem_usage=True,
+                torch_dtype=torch.float32
+            )
+        
+        return pipeline(
+            "summarization",
+            model=model,
+            tokenizer=tokenizer,
+            framework="pt",
+            device=-1,  # Force CPU
+            batch_size=1
         )
     except Exception as e:
-        print(f"Error: Could not load fallback model: {e}")
-        summarizer = None
+        print(f"AI model initialization error: {e}")
+        return None
+
+summarizer = init_ai_model()
+
+# Add search result caching
+def cache_key(query, **kwargs):
+    cache_str = f"{query}:{kwargs}"
+    return hashlib.md5(cache_str.encode()).hexdigest()
+
+def cache_results(func):
+    @functools.wraps(func)
+    def wrapper(query, *args, **kwargs):
+        key = cache_key(query, **kwargs)
+        cache_file = SEARCH_CACHE_DIR / f"{key}.pickle"
+        
+        # Check cache expiry (24 hours)
+        if cache_file.exists() and (time.time() - cache_file.stat().st_mtime) < 86400:
+            with open(cache_file, 'rb') as f:
+                return pickle.load(f)
+        
+        results = func(query, *args, **kwargs)
+        
+        # Cache results
+        with open(cache_file, 'wb') as f:
+            pickle.dump(results, f)
+        
+        return results
+    return wrapper
 
 def detect_file_type(url):
     parsed = urlparse(url)
@@ -90,186 +153,292 @@ def get_user_region(request):
         pass
     return None
 
+def get_regional_domains(domain):
+    try:
+        # Extract base domain
+        ext = tldextract.extract(domain)
+        base_domain = f"{ext.domain}.{ext.suffix}"
+        
+        # Common regional TLD patterns
+        regional_tlds = [
+            'co.uk', 'co.jp', 'co.in', 'com.au', 'co.nz',
+            'de', 'fr', 'es', 'it', 'ca', 'br', 'mx',
+            'ru', 'cn', 'jp', 'kr', 'in', 'au', 'nz'
+        ]
+        
+        # Check domain variants in parallel
+        domains = []
+        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+            futures = []
+            # Check main domain
+            futures.append(executor.submit(check_domain, f"{ext.domain}.com"))
+            # Check regional variants
+            for tld in regional_tlds:
+                test_domain = f"{ext.domain}.{tld}"
+                futures.append(executor.submit(check_domain, test_domain))
+            
+            # Collect results
+            for future in concurrent.futures.as_completed(futures):
+                if future.result():
+                    domains.append(future.result())
+        
+        return domains
+    except Exception as e:
+        print(f"Error getting regional domains: {e}")
+        return []
+
+def check_domain(domain):
+    try:
+        answers = dns.resolver.resolve(domain, 'A')
+        if answers:
+            return domain
+    except:
+        return None
+
 def resolve_regional_url(url, region=None):
     try:
         parsed = urlparse(url)
         if not parsed.netloc:
             return url
             
-        # Common regional patterns
-        regional_domains = {
-            'google.com': {'in': 'google.co.in', 'uk': 'google.co.uk'},
-            'amazon.com': {'in': 'amazon.in', 'uk': 'amazon.co.uk'},
-            # Add more as needed
-        }
+        # Extract domain parts
+        ext = tldextract.extract(parsed.netloc)
+        base_domain = f"{ext.domain}.{ext.suffix}"
         
-        domain = parsed.netloc.lower()
-        base_domain = '.'.join(domain.split('.')[-2:])
+        # Get all regional variants
+        regional_domains = get_regional_domains(base_domain)
         
-        if base_domain in regional_domains and region:
-            regional_domain = regional_domains[base_domain].get(region)
-            if regional_domain:
-                return urljoin(f"https://{regional_domain}", parsed.path)
-    except:
-        pass
-    return url
+        # If we have a specific region, try to match it
+        if region and regional_domains:
+            for domain in regional_domains:
+                if region.lower() in domain:
+                    return urljoin(f"https://{domain}", parsed.path)
+        
+        # Otherwise return original URL
+        return url
+        
+    except Exception as e:
+        print(f"URL resolution error: {e}")
+        return url
 
-def google_search(query, num=20, file_type=None, region=None):
+@cache_results
+def google_search(query, num=20, file_type=None, section=None):
     try:
         service = build("customsearch", "v1", developerKey=GOOGLE_API_KEY)
         
-        # Validate credentials
-        if not GOOGLE_API_KEY or not SEARCH_ENGINE_ID:
-            raise ValueError("Missing Google API credentials")
-        
-        # Clean and prepare query
-        query = query.strip()
-        if not query:
+        if not query.strip():
             return []
-        
-        search_query = query
-        if file_type:
-            search_query = f"{query} filetype:{file_type}"
-        
-        try:
-            result = service.cse().list(
-                q=search_query,
-                cx=SEARCH_ENGINE_ID,
-                num=min(num, 10),  # Google CSE free tier limit
-                safe='active',  # Safe search
-                gl=region.upper() if region else None  # Add country restriction
-            ).execute()
             
+        # Add file type if specified
+        search_query = f"{query.strip()} filetype:{file_type}" if file_type else query.strip()
+        
+        # Build search parameters
+        search_params = {
+            'q': search_query,
+            'cx': SEARCH_ENGINE_ID,
+            'num': min(num, 10),
+            'safe': 'off'
+        }
+        
+        # Add location if available
+        if 'user_location' in session:
+            location = session['user_location']
+            search_params.update({
+                'gl': location['country'].upper(),  # Geographic location
+                'cr': f"country{location['country'].upper()}"  # Country restrict
+            })
+        
+        # Add section-specific parameters
+        if section == 'images':
+            search_params['searchType'] = 'image'
+        elif section == 'news':
+            search_params['dateRestrict'] = 'd7'
+        
+        # Execute search
+        result = service.cse().list(**search_params).execute()
+        
+        # Process results based on section
+        if section == 'images':
+            return [{
+                'title': item.get('title', ''),
+                'link': item.get('link', ''),
+                'thumbnail': item.get('image', {}).get('thumbnailLink', ''),
+                'context': item.get('image', {}).get('contextLink', '')
+            } for item in result.get('items', [])]
+            
+        elif section == 'shopping':
+            return [{
+                'title': item.get('title', ''),
+                'link': item.get('link', ''),
+                'price': item.get('pagemap', {}).get('offer', [{}])[0].get('price', 'N/A'),
+                'merchant': item.get('pagemap', {}).get('organization', [{}])[0].get('name', ''),
+                'image': item.get('pagemap', {}).get('cse_image', [{}])[0].get('src', '')
+            } for item in result.get('items', [])]
+            
+        else:
             items = result.get('items', [])
-            
-        except Exception as e:
-            print(f"Search API error: {e}")
-            # Return empty results on API error
-            return []
         
-        # Enhance results with file type and content
-        enhanced_results = []
-        for item in items:
-            try:
-                # Resolve regional URL
-                item['link'] = resolve_regional_url(item['link'], region)
-                file_type = detect_file_type(item['link'])
-                content = extract_page_content(item['link']) if file_type == 'webpage' else ""
-                
-                enhanced_results.append({
-                    **item,
-                    'file_type': file_type,
-                    'content': content
-                })
-            except Exception as e:
-                print(f"Error processing result: {e}")
-                continue
-        
-        return enhanced_results
+            # Process results with regional awareness
+            enhanced_results = []
+            for item in items:
+                try:
+                    # Resolve regional URL
+                    regional_url = resolve_regional_url(item.get('link', ''), region)
+                    
+                    enhanced_results.append({
+                        'title': item.get('title', ''),
+                        'link': regional_url,
+                        'original_link': item.get('link', ''),
+                        'snippet': item.get('snippet', ''),
+                        'file_type': detect_file_type(regional_url),
+                        'mime': item.get('mime', ''),
+                        'date': item.get('pagemap', {}).get('metatags', [{}])[0].get('date', ''),
+                        'content': extract_page_content(regional_url) if detect_file_type(regional_url) == 'webpage' else ''
+                    })
+                except Exception as e:
+                    print(f"Result processing error: {e}")
+                    continue
+                    
+            return enhanced_results
         
     except Exception as e:
-        print(f"Google Search error: {e}")
+        print(f"Search error: {e}")
         return []
 
 def process_with_ai(query, search_results):
-    if not summarizer:
-        return "AI analysis currently unavailable. Please try again later."
-    
-    # Group results by file type
-    grouped_results = {}
-    for result in search_results:
-        ft = result['file_type']
-        if ft not in grouped_results:
-            grouped_results[ft] = []
-        grouped_results[ft].append(result)
-    
-    # Create enhanced context
-    context = f"Search Query: {query}\n\nResults Summary:\n"
-    for file_type, results in grouped_results.items():
-        context += f"\n{file_type} Results ({len(results)}):\n"
-        for r in results[:3]:
-            context += f"- {r['title']}\n  {r['snippet']}\n"
-    
+    if not search_results:
+        return None
+        
     try:
-        input_length = len(context.split())
-        max_length = min(input_length - 10, 100)  # Ensure shorter summary
-        min_length = max(30, max_length // 2)  # Dynamic min length
+        # Create a simpler context for the AI
+        snippets = [r['snippet'] for r in search_results[:3] if r.get('snippet')]  # Reduced from 5 to 3
+        if not snippets:
+            return None
+            
+        context = f"Search: {query}\n\n" + "\n".join(snippets)
         
-        if hasattr(summarizer, "task") and summarizer.task == "summarization":
-            summary = summarizer(context, 
-                               max_length=max_length,
-                               min_length=min_length,
-                               do_sample=False)[0]['summary_text']
-        else:
-            summary = summarizer(context, 
-                               max_length=max_length,
-                               num_return_sequences=1,
-                               do_sample=False)[0]['generated_text']
+        # Generate summary with error handling and chunking
+        try:
+            chunks = [context[i:i+512] for i in range(0, len(context), 512)]
+            summaries = []
+            
+            for chunk in chunks:
+                result = summarizer(
+                    chunk,
+                    max_length=130,
+                    min_length=30,
+                    do_sample=False,
+                    num_beams=1  # Reduced from 2
+                )
+                if result:
+                    summaries.append(result[0]['summary_text'])
+            
+            if not summaries:
+                return None
+                
+            summary = " ".join(summaries)
+                
+        except Exception as e:
+            print(f"Summarization error: {e}")
+            return None
         
-        return f"""Search Analysis:
-1. Found {len(search_results)} results across {len(grouped_results)} file types
-2. {summary}
-3. Suggested search refinements:
-   - Add filetype: for specific document types
-   - Use quotes for exact phrases
-   - Try more specific keywords"""
-    
+        return f"""📌 Key Points:
+{summary}
+
+💡 Search Tips:
+• Add quotes for exact phrases
+• Try different keywords
+• Use filters for better results"""
+
     except Exception as e:
         print(f"AI processing error: {e}")
-        return "Could not generate AI analysis. Showing raw search results."
+        return None
 
 @app.route('/')
 def home():
     return render_template('index.html')
 
+@app.route('/update_location', methods=['POST'])
+def update_location():
+    try:
+        data = request.json
+        lat, lon = data['lat'], data['lon']
+        
+        # Get location details
+        location = rg.search((lat, lon))[0]
+        
+        # Store in session
+        session['user_location'] = {
+            'lat': lat,
+            'lon': lon,
+            'country': location['cc'],
+            'city': location['name']
+        }
+        
+        return jsonify({'status': 'success'})
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 400
+
 @app.route('/search')
 def search():
     query = request.args.get('q', '').strip()
     file_type = request.args.get('type', None)
+    section = request.args.get('section', None)
     
     if not query:
         return render_template('index.html')
     
     try:
-        # Get user's region
-        region = get_user_region(request)
-        search_results = google_search(query, file_type=file_type, region=region)
+        results = google_search(query, file_type=file_type, section=section)
         
-        if not search_results:
-            error_message = "No results found. Please try different keywords."
-            if not GOOGLE_API_KEY or not SEARCH_ENGINE_ID:
-                error_message = "Search configuration error. Please check API settings."
+        if not results:
             return render_template('results.html',
                                 query=query,
-                                grouped_results={},
-                                ai_response=error_message,
-                                selected_type=file_type,
-                                error=True)
+                                error="No results found. Try different keywords.",
+                                section=section,
+                                grouped_results={})
         
-        ai_response = process_with_ai(query, search_results)
+        if section == 'images':
+            return render_template('results.html',
+                                query=query,
+                                section=section,
+                                image_results=results)
+                                
+        elif section == 'shopping':
+            return render_template('results.html',
+                                query=query,
+                                section=section,
+                                shopping_results=results)
         
-        # Group results by file type
-        grouped_results = {}
-        for result in search_results:
-            ft = result['file_type']
-            if ft not in grouped_results:
-                grouped_results[ft] = []
-            grouped_results[ft].append(result)
-        
-        return render_template('results.html',
-                             query=query,
-                             grouped_results=grouped_results,
-                             ai_response=ai_response,
-                             selected_type=file_type)
+        else:
+            # Get search results
+            results = google_search(query, file_type=file_type)
+            
+            # Process with AI only for informational queries
+            ai_response = None
+            if len(query.split()) > 2:  # Only process complex queries
+                ai_response = process_with_ai(query, results)
+            
+            # Group results
+            grouped_results = {}
+            for result in results:
+                ft = result['file_type']
+                if ft not in grouped_results:
+                    grouped_results[ft] = []
+                grouped_results[ft].append(result)
+            
+            return render_template('results.html',
+                                query=query,
+                                grouped_results=grouped_results,
+                                ai_response=ai_response,
+                                selected_type=file_type)
                              
     except Exception as e:
-        print(f"Search route error: {e}")
         return render_template('results.html',
                              query=query,
-                             grouped_results={},
-                             ai_response="An error occurred during search. Please try again.",
-                             selected_type=file_type,
-                             error=True)
+                             error=f"Search error: {str(e)}",
+                             section=section,
+                             grouped_results={})
 
 if __name__ == '__main__':
     app.run(debug=True)

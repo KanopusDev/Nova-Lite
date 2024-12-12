@@ -7,3 +7,7 @@ torch>=2.0.0
 beautifulsoup4>=4.9.3
 requests>=2.25.1
 geoip2>=4.1.0
+tldextract>=3.1.0
+dnspython>=2.1.0
+reverse_geocoder>=1.5.1
+diskcache>=5.4.0
