@@ -104,7 +104,7 @@ python app.py
 ## License
 
 This project is licensed under the Nova Lite Search Engine License (NLS v1.0).
-See LICENSE.md for details.
+See (LICENSE.md)[LICENSE] for details.
 
 ## Acknowledgments
 
