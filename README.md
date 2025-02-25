@@ -16,7 +16,7 @@ An AI-powered search engine with intelligent summarization and region-aware resu
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/Canopus-Development/nova-lite.git
+git clone https://github.com/Kanopusdev/nova-lite.git
 cd nova-lite
 ```
 
@@ -104,7 +104,7 @@ python app.py
 ## License
 
 This project is licensed under the Nova Lite Search Engine License (NLS v1.0).
-See [LICENSE](LICENSE.md) for details.
+See LICENSE.md for details.
 
 ## Acknowledgments
 
